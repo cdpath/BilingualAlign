@@ -1,0 +1,9 @@
+markdown-it-py
+spacy>=3.0.0,<4.0.0
+nltk>=3.0.0
+sentence-transformers>=2.0.0
+torch>=1.6.0
+# spaCy models need to be downloaded, e.g., python -m spacy download en_core_web_sm
+en_core_web_sm
+# spaCy models need to be downloaded, e.g., python -m spacy download zh_core_web_sm
+zh_core_web_sm
