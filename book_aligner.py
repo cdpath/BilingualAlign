@@ -10,7 +10,7 @@ import json
 NLP_MODELS = {}
 EMBEDDING_MODEL = None
 
-# Attempt to ensure NLTK's 'punkt' is available
+# ensure NLTK's 'punkt' is available
 try:
     nltk.data.find('tokenizers/punkt')
 except nltk.downloader.DownloadError:
