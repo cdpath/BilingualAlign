@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.1-cudnn9-runtime
 
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
       sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources && \
