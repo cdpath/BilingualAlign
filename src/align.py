@@ -3,6 +3,7 @@ Bilingual Book Sentence Aligner
 
 Aligns English and Chinese sentences from books in Markdown format using sentence embeddings.
 """
+
 import re
 import spacy
 from sentence_transformers import SentenceTransformer, util
@@ -11,199 +12,254 @@ import csv
 import json
 import argparse
 import sys
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Union
+from dataclasses import dataclass, field
+import logging
 
 __version__ = "0.1.0"
 
-NLP_MODELS = {}
-EMBEDDING_MODEL = None
-chapter_alignment_stats = {}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-def _ensure_sentencizer(nlp):
-    """Add spaCy sentencizer if dependency parser is missing."""
-    if "parser" not in nlp.pipe_names and "sentencizer" not in nlp.pipe_names:
-        nlp.add_pipe("sentencizer")
-    return nlp
+ENGLISH_NON_CONTENT = [
+    "prologue",
+    "epilogue",
+    "acknowledgement",
+    "acknowledgments",
+    "permission",
+    "permissions",
+    "index",
+    "contents",
+    "copyright",
+    "list of",
+    "![",
+    "cover",
+    "title",
+    "preface",
+    "foreword",
+    "introduction",
+    "about",
+    "bibliography",
+    "appendix",
+    "glossary",
+]
+
+CHINESE_NON_CONTENT = [
+    "版权",
+    "目录",
+    "序言",
+    "后记",
+    "致谢",
+    "译后记",
+    "![",
+    "前言",
+    "序",
+    "跋",
+    "附录",
+    "索引",
+]
 
 
-def segment_sentences(text: str, language: str) -> list[str]:
+@dataclass
+class AlignmentConfig:
+    """Configuration for the alignment process."""
+
+    similarity_threshold: float = 0.7
+    chapter_similarity_threshold: float = 0.35
+    embedding_model_name: str = "paraphrase-multilingual-MiniLM-L12-v2"
+    english_model: str = "en_core_web_sm"
+    chinese_model: str = "zh_core_web_sm"
+
+
+@dataclass
+class ChapterStats:
+    """Statistics for chapter alignment."""
+
+    total_english_chapters: int = 0
+    total_chinese_chapters: int = 0
+    matched_pairs: int = 0
+    english_match_rate: float = 0.0
+    chinese_match_rate: float = 0.0
+    similarity_threshold: float = 0.35
+    matched_chapters: List[Dict] = field(default_factory=list)
+    unmatched_english: List[Dict] = field(default_factory=list)
+    unmatched_chinese: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class ProcessingDetails:
+    """Details for chapter processing."""
+
+    english_chapter: str
+    chinese_chapter: str
+    english_sentences_count: int
+    chinese_sentences_count: int
+    aligned_sentences_count: int = 0
+    sentence_match_rate: float = 0.0
+    avg_similarity_score: float = 0.0
+
+
+class ModelManager:
+    """Manages NLP and embedding models - keeps state so class is justified."""
+
+    def __init__(self, config: AlignmentConfig):
+        self.config = config
+        self._nlp_models: Dict[str, Optional[spacy.Language]] = {}
+        self._embedding_model: Optional[SentenceTransformer] = None
+
+    def _ensure_sentencizer(self, nlp: spacy.Language) -> spacy.Language:
+        """Add spaCy sentencizer if dependency parser is missing."""
+        if "parser" not in nlp.pipe_names and "sentencizer" not in nlp.pipe_names:
+            nlp.add_pipe("sentencizer")
+        return nlp
+
+    def get_nlp_model(self, language: str) -> Optional[spacy.Language]:
+        """Get or load NLP model for the specified language."""
+        model_key = language[:2]  # 'en' or 'zh'
+
+        if model_key in self._nlp_models:
+            return self._nlp_models[model_key]
+
+        model_name = (
+            self.config.english_model
+            if language == "english"
+            else self.config.chinese_model
+        )
+
+        try:
+            nlp = spacy.load(model_name, exclude=["ner", "lemmatizer"])
+            self._nlp_models[model_key] = self._ensure_sentencizer(nlp)
+            logger.info(f"Loaded '{model_name}' spaCy model.")
+            return self._nlp_models[model_key]
+        except OSError:
+            logger.error(f"Error loading '{model_name}' spaCy model.")
+            logger.info(f"To install: python -m spacy download {model_name}")
+            if language == "chinese":
+                logger.info("Falling back to regex for Chinese sentence segmentation.")
+                self._nlp_models[model_key] = None
+                return None
+            raise
+
+    @property
+    def embedding_model(self) -> Optional[SentenceTransformer]:
+        """Get or load the embedding model."""
+        if self._embedding_model is None:
+            self._load_embedding_model()
+        return self._embedding_model
+
+    def _load_embedding_model(self) -> None:
+        """Load the sentence embedding model."""
+        try:
+            # Prefer MPS (Apple Silicon) > CUDA > CPU
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+
+            self._embedding_model = SentenceTransformer(
+                self.config.embedding_model_name, device=device
+            )
+            logger.info(
+                f"Embedding model '{self.config.embedding_model_name}' loaded successfully on {device}."
+            )
+        except Exception as e:
+            logger.error(
+                f"Error loading embedding model '{self.config.embedding_model_name}': {e}"
+            )
+            self._embedding_model = None
+
+
+# File I/O functions - plain functions are better for stateless operations
+def read_file(file_path: Union[str, Path]) -> str:
+    """Read a file and return its content."""
+    path = Path(file_path)
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.error(f"File not found: {path}")
+        raise
+    except Exception as e:
+        logger.error(f"Error reading file {path}: {e}")
+        raise
+
+
+def write_tsv(aligned_data: List[Dict], output_path: Union[str, Path]) -> None:
+    """Write aligned sentence data to a TSV file."""
+    path = Path(output_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow(["English Sentence", "Chinese Sentence", "Alignment Score"])
+            for item in aligned_data:
+                writer.writerow([item["english"], item["chinese"], item["score"]])
+        logger.info(f"Successfully wrote data to TSV: {path}")
+    except IOError as e:
+        logger.error(f"Error writing to TSV file {path}: {e}")
+        raise
+
+
+def write_json(data: Union[List, Dict], output_path: Union[str, Path]) -> None:
+    """Write data to a JSON file."""
+    path = Path(output_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        logger.info(f"Successfully wrote data to JSON: {path}")
+    except IOError as e:
+        logger.error(f"Error writing to JSON file {path}: {e}")
+        raise
+
+
+def write_alignment_report(report_data: Dict, output_path: Union[str, Path]) -> None:
+    """Write a detailed matching report to a JSON file."""
+    path = Path(output_path)
+    report_path = path.parent / "alignment_report.json"
+    write_json(report_data, report_path)
+
+
+# Text processing functions
+def segment_sentences(
+    text: str, language: str, model_manager: ModelManager
+) -> List[str]:
     """Segments text into sentences based on language."""
     if language == "english":
-        if "en" not in NLP_MODELS:
-            try:
-                nlp = spacy.load("en_core_web_sm", exclude=["ner", "lemmatizer"])
-                NLP_MODELS["en"] = _ensure_sentencizer(nlp)
-                print("Loaded 'en_core_web_sm' spaCy model.")
-            except OSError:
-                print(
-                    "Error loading 'en_core_web_sm' spaCy model."
-                )
-                print("To install: python -m spacy download en_core_web_sm")
-                raise  # Raise the exception instead of falling back
+        nlp = model_manager.get_nlp_model("english")
+        if nlp is None:
+            return []
 
-        doc = NLP_MODELS["en"](text)
+        doc = nlp(text)
         return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
 
     elif language == "chinese":
-        if "zh" not in NLP_MODELS:
-            try:
-                nlp = spacy.load("zh_core_web_sm", exclude=["ner", "lemmatizer"])
-                NLP_MODELS["zh"] = _ensure_sentencizer(nlp)
-                print("Loaded 'zh_core_web_sm' spaCy model.")
-            except OSError:
-                print(
-                    "Error loading 'zh_core_web_sm' spaCy model. Falling back to regex."
-                )
-                print("To install: python -m spacy download zh_core_web_sm")
-                NLP_MODELS["zh"] = None  # Mark as failed to avoid retrying
+        nlp = model_manager.get_nlp_model("chinese")
 
-        if NLP_MODELS.get("zh"):
-            doc = NLP_MODELS["zh"](text)
+        if nlp is not None:
+            doc = nlp(text)
             return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
         else:
-            print("Using regex for Chinese sentence segmentation.")
+            logger.info("Using regex for Chinese sentence segmentation.")
             # Keep punctuation, handle …… and Western full stop properly
             sentences = re.split(r"(?<=[。！？；…])\s*", text)
             return [s.strip() for s in sentences if s.strip()]
 
     else:
-        print(
-            f"Warning: Language '{language}' not supported for sentence segmentation."
+        logger.warning(
+            f"Language '{language}' not supported for sentence segmentation."
         )
         return []
 
 
-def write_to_tsv(aligned_data: list[dict], output_filepath: str):
-    """Writes aligned sentence data to a TSV file."""
-    try:
-        with open(output_filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter="\t")
-            writer.writerow(["English Sentence", "Chinese Sentence", "Alignment Score"])
-            for item in aligned_data:
-                writer.writerow([item["english"], item["chinese"], item["score"]])
-        print(f"Successfully wrote data to TSV: {output_filepath}")
-    except IOError as e:
-        print(f"Error writing to TSV file {output_filepath}: {e}")
-
-
-def write_to_json(aligned_data: list[dict], output_filepath: str):
-    """Writes aligned sentence data to a JSON file."""
-    try:
-        with open(output_filepath, "w", encoding="utf-8") as f:
-            json.dump(aligned_data, f, ensure_ascii=False, indent=4)
-        print(f"Successfully wrote data to JSON: {output_filepath}")
-    except IOError as e:
-        print(f"Error writing to JSON file {output_filepath}: {e}")
-
-
-def write_match_report(report_data: dict, output_filepath: str):
-    """Writes a detailed matching report to a JSON file."""
-    try:
-        output_dir = output_filepath.rsplit('/', 1)[0] if '/' in output_filepath else '.'
-        report_path = f"{output_dir}/alignment_report.json"
-        
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, ensure_ascii=False, indent=2)
-        print(f"Successfully wrote alignment report: {report_path}")
-    except IOError as e:
-        print(f"Error writing alignment report: {e}")
-
-
-def load_embedding_model(model_name="paraphrase-multilingual-MiniLM-L12-v2"):
-    """Loads the sentence embedding model."""
-    global EMBEDDING_MODEL
-    try:
-        # Prefer MPS (Apple Silicon) > CUDA > CPU
-        if torch.backends.mps.is_available():
-            device = "mps"
-        elif torch.cuda.is_available():
-            device = "cuda"
-        else:
-            device = "cpu"
-        
-        EMBEDDING_MODEL = SentenceTransformer(model_name, device=device)
-        print(f"Embedding model '{model_name}' loaded successfully on {device}.")
-    except Exception as e:
-        print(f"Error loading embedding model '{model_name}': {e}")
-        EMBEDDING_MODEL = None
-
-
-def align_sentences_in_chapters(
-    english_sentences: list[str],
-    chinese_sentences: list[str],
-    embedding_model,
-    similarity_threshold: float = 0.5,
-) -> list[dict]:
-    """Aligns sentences between two lists using semantic similarity."""
-    if not english_sentences or not chinese_sentences:
-        return []
-    if not embedding_model:
-        print("Embedding model not loaded. Cannot align sentences.")
-        return []
-
-    try:
-        with torch.no_grad():  # Save GPU memory
-            english_embeddings = embedding_model.encode(
-                english_sentences, convert_to_tensor=True
-            )
-            chinese_embeddings = embedding_model.encode(
-                chinese_sentences, convert_to_tensor=True
-            )
-    except Exception as e:
-        print(f"Error encoding sentences: {e}")
-        return []
-
-    aligned_sentence_pairs = []
-    total_potential_alignments = 0
-    filtered_out_count = 0
-
-    # Vectorize similarity computation - calculate all similarities at once
-    similarities = util.cos_sim(english_embeddings, chinese_embeddings)
-    used_chinese_indices = set()
-
-    for i in range(len(english_sentences)):
-        if similarities is None or similarities.numel() == 0:
-            continue
-
-        # Find best match for this English sentence
-        row = similarities[i]
-        best_match_index = torch.argmax(row)
-        max_sim_score = row[best_match_index].item()
-        best_idx = best_match_index.item()
-
-        total_potential_alignments += 1
-
-        # Only align if score is above threshold and Chinese sentence hasn't been used
-        if max_sim_score >= similarity_threshold and best_idx not in used_chinese_indices:
-            used_chinese_indices.add(best_idx)
-            aligned_sentence_pairs.append(
-                {
-                    "english": english_sentences[i],
-                    "chinese": chinese_sentences[best_idx],
-                    "score": max_sim_score,
-                }
-            )
-        else:
-            filtered_out_count += 1
-
-    if total_potential_alignments > 0:
-        print(
-            f"    Filtered out {filtered_out_count}/{total_potential_alignments} alignments below threshold {similarity_threshold}"
-        )
-        if aligned_sentence_pairs:
-            scores = [pair["score"] for pair in aligned_sentence_pairs]
-            avg_score = sum(scores) / len(scores)
-            min_score = min(scores)
-            max_score = max(scores)
-            print(
-                f"    Accepted alignments: avg={avg_score:.3f}, min={min_score:.3f}, max={max_score:.3f}"
-            )
-
-    return aligned_sentence_pairs
-
-
-def split_into_chapters(markdown_content: str) -> list[dict]:
-    """Splits Markdown content into chapters based on H1-H5 headings."""
+def split_into_chapters(markdown_content: str) -> List[Dict]:
+    """Split Markdown content into chapters based on H1-H5 headings."""
     chapters = []
     # Accept # through ##### headings to handle Chinese markdown with ### chapters
     pattern = re.compile(r"^(#{1,5})\s+(.*?)\s*$", re.MULTILINE)
@@ -221,151 +277,13 @@ def split_into_chapters(markdown_content: str) -> list[dict]:
             content_end = len(markdown_content)
 
         content = markdown_content[content_start:content_end].strip()
-
         chapters.append({"title": title, "content": content})
 
     return chapters
 
 
-def auto_align_chapters(eng_chapters: list[dict], chi_chapters: list[dict]) -> tuple[list[tuple[int, int]], dict]:
-    """
-    Compute cosine similarity of whole-chapter embeddings and return
-    a list of index pairs with a greedy/max-weight-matching algorithm.
-    
-    Args:
-        eng_chapters: List of English chapter dictionaries
-        chi_chapters: List of Chinese chapter dictionaries
-        
-    Returns:
-        Tuple of:
-        - List of (eng_idx, chi_idx) tuples representing optimal alignments
-        - Dictionary with detailed alignment statistics
-    """
-    if not eng_chapters or not chi_chapters or not EMBEDDING_MODEL:
-        return [], {}
-    
-    print("Computing chapter-level embeddings for automatic alignment...")
-    
-    try:
-        # Get content embeddings for all chapters
-        eng_contents = [ch['content'] for ch in eng_chapters]
-        chi_contents = [ch['content'] for ch in chi_chapters]
-        
-        with torch.no_grad():
-            eng_vec = EMBEDDING_MODEL.encode(eng_contents, convert_to_tensor=True)
-            chi_vec = EMBEDDING_MODEL.encode(chi_contents, convert_to_tensor=True)
-        
-        # Compute similarity matrix (E × C)
-        sim = util.cos_sim(eng_vec, chi_vec)
-        
-        # Store original similarity matrix for reporting
-        original_sim = sim.clone()
-        
-        pairs = []
-        similarity_threshold = 0.35  # Adjustable cut-off for chapter similarity
-        matched_details = []
-        
-        # Greedy matching: repeatedly find the highest similarity pair
-        while True:
-            # Find the maximum similarity in the remaining matrix
-            idx = torch.argmax(sim)
-            score = sim.flatten()[idx].item()
-            
-            if score < similarity_threshold:
-                break
-                
-            # Convert flat index to row, column
-            r, c = divmod(idx.item(), sim.size(1))
-            pairs.append((r, c))
-            
-            matched_details.append({
-                "english_index": r,
-                "english_title": eng_chapters[r]['title'],
-                "chinese_index": c, 
-                "chinese_title": chi_chapters[c]['title'],
-                "similarity_score": score
-            })
-            
-            print(f"  Matched: EN '{eng_chapters[r]['title']}' ↔ CN '{chi_chapters[c]['title']}' (score: {score:.3f})")
-            
-            # Mark this row and column as used by setting to -1
-            sim[r, :] = -1.0
-            sim[:, c] = -1.0
-        
-        # Find unmatched chapters
-        matched_eng_indices = {pair[0] for pair in pairs}
-        matched_chi_indices = {pair[1] for pair in pairs}
-        
-        unmatched_english = []
-        for i, ch in enumerate(eng_chapters):
-            if i not in matched_eng_indices:
-                unmatched_english.append({
-                    "index": i,
-                    "title": ch['title'],
-                    "best_match_score": original_sim[i].max().item(),
-                    "best_match_chinese": chi_chapters[original_sim[i].argmax().item()]['title']
-                })
-        
-        unmatched_chinese = []
-        for i, ch in enumerate(chi_chapters):
-            if i not in matched_chi_indices:
-                unmatched_chinese.append({
-                    "index": i,
-                    "title": ch['title'],
-                    "best_match_score": original_sim[:, i].max().item(),
-                    "best_match_english": eng_chapters[original_sim[:, i].argmax().item()]['title']
-                })
-        
-        # Calculate matching statistics
-        alignment_stats = {
-            "total_english_chapters": len(eng_chapters),
-            "total_chinese_chapters": len(chi_chapters),
-            "matched_pairs": len(pairs),
-            "english_match_rate": len(pairs) / len(eng_chapters) if eng_chapters else 0,
-            "chinese_match_rate": len(pairs) / len(chi_chapters) if chi_chapters else 0,
-            "similarity_threshold": similarity_threshold,
-            "matched_chapters": matched_details,
-            "unmatched_english": unmatched_english,
-            "unmatched_chinese": unmatched_chinese
-        }
-        
-        # Sort pairs by English chapter index for consistent ordering
-        pairs.sort()
-        return pairs, alignment_stats
-        
-    except Exception as e:
-        print(f"Error in automatic chapter alignment: {e}")
-        return [], {}
-
-
 def is_content_chapter(title: str) -> bool:
     """Check if a chapter title represents actual content rather than metadata."""
-    # English patterns for non-content
-    english_non_content = [
-        "prologue",
-        "epilogue",
-        "acknowledgement",
-        "acknowledgments",
-        "permission",
-        "permissions",
-        "index",
-        "contents",
-        "copyright",
-        "list of",
-        "![",  # Images
-        "cover",
-        "title",
-        "preface",
-        "foreword",
-        "introduction",
-        "about",
-        "bibliography",
-        "appendix",
-        "glossary",
-    ]
-    # Chinese patterns for non-content
-    chinese_non_content = ["版权", "目录", "序言", "后记", "致谢", "译后记", "![", "前言", "序", "跋", "附录", "索引"]
-
     title_lower = title.lower().strip()
 
     # Skip empty titles
@@ -377,12 +295,12 @@ def is_content_chapter(title: str) -> bool:
         return False
 
     # Check for English non-content patterns
-    for pattern in english_non_content:
+    for pattern in ENGLISH_NON_CONTENT:
         if pattern in title_lower:
             return False
 
     # Check for Chinese non-content patterns
-    for pattern in chinese_non_content:
+    for pattern in CHINESE_NON_CONTENT:
         if pattern in title:
             return False
 
@@ -416,328 +334,695 @@ def is_content_chapter(title: str) -> bool:
     return False
 
 
-def get_user_chapter_alignments(
-    english_chapters: list[dict], chinese_chapters: list[dict], manual_align: str = None, auto_align: bool = False
-) -> list[tuple[dict, dict]]:
+def auto_align_chapters(
+    eng_chapters: List[Dict],
+    chi_chapters: List[Dict],
+    model_manager: ModelManager,
+    config: AlignmentConfig,
+) -> Tuple[List[Tuple[int, int]], ChapterStats]:
     """
-    Prompts the user to provide chapter alignments or uses intelligent default alignments.
-    
-    Args:
-        english_chapters: List of English chapter dictionaries
-        chinese_chapters: List of Chinese chapter dictionaries  
-        manual_align: Manual alignment string like "1-1 2-3 4-0"
-        auto_align: Whether to use automatic alignment based on content similarity
+    Compute cosine similarity of whole-chapter embeddings and return
+    a list of index pairs with a greedy/max-weight-matching algorithm.
     """
-    print("\n--- Chapter Alignment Input ---")
-    
-    # Filter chapters to get only content chapters
-    english_content_chapters = [
-        ch for ch in english_chapters if is_content_chapter(ch["title"])
-    ]
-    chinese_content_chapters = [
-        ch for ch in chinese_chapters if is_content_chapter(ch["title"])
-    ]
+    if not eng_chapters or not chi_chapters:
+        return [], ChapterStats()
 
-    print(f"\nFiltered to content chapters:")
-    print(f"English content chapters: {len(english_content_chapters)}")
-    for i, ch in enumerate(english_content_chapters[:5]):  # Show first 5
-        print(f"  {i+1}: {ch['title']}")
-    if len(english_content_chapters) > 5:
-        print(f"  ... and {len(english_content_chapters) - 5} more")
+    embedding_model = model_manager.embedding_model
+    if not embedding_model:
+        logger.error("Embedding model not available for chapter alignment")
+        return [], ChapterStats()
 
-    print(f"Chinese content chapters: {len(chinese_content_chapters)}")
-    for i, ch in enumerate(chinese_content_chapters[:5]):  # Show first 5
-        print(f"  {i+1}: {ch['title']}")
-    if len(chinese_content_chapters) > 5:
-        print(f"  ... and {len(chinese_content_chapters) - 5} more")
+    logger.info("Computing chapter-level embeddings for automatic alignment...")
 
-    aligned_pairs = []
+    try:
+        # Get content embeddings for all chapters
+        eng_contents = [ch["content"] for ch in eng_chapters]
+        chi_contents = [ch["content"] for ch in chi_chapters]
 
-    # Handle manual alignment string
-    if manual_align and manual_align.strip():
-        print(f"\nUsing manual alignment: {manual_align}")
+        with torch.no_grad():
+            eng_vec = embedding_model.encode(eng_contents, convert_to_tensor=True)
+            chi_vec = embedding_model.encode(chi_contents, convert_to_tensor=True)
+
+        # Compute similarity matrix (E × C)
+        sim = util.cos_sim(eng_vec, chi_vec)
+
+        # Store original similarity matrix for reporting
+        original_sim = sim.clone()
+
+        pairs = []
+        matched_details = []
+
+        # Greedy matching: repeatedly find the highest similarity pair
+        while True:
+            # Find the maximum similarity in the remaining matrix
+            idx = torch.argmax(sim)
+            score = sim.flatten()[idx].item()
+
+            if score < config.chapter_similarity_threshold:
+                break
+
+            # Convert flat index to row, column
+            r, c = divmod(idx.item(), sim.size(1))
+            pairs.append((r, c))
+
+            matched_details.append(
+                {
+                    "english_index": r,
+                    "english_title": eng_chapters[r]["title"],
+                    "chinese_index": c,
+                    "chinese_title": chi_chapters[c]["title"],
+                    "similarity_score": score,
+                }
+            )
+
+            logger.info(
+                f"  Matched: EN '{eng_chapters[r]['title']}' ↔ CN '{chi_chapters[c]['title']}' (score: {score:.3f})"
+            )
+
+            # Mark this row and column as used by setting to -1
+            sim[r, :] = -1.0
+            sim[:, c] = -1.0
+
+        # Find unmatched chapters
+        matched_eng_indices = {pair[0] for pair in pairs}
+        matched_chi_indices = {pair[1] for pair in pairs}
+
+        unmatched_english = []
+        for i, ch in enumerate(eng_chapters):
+            if i not in matched_eng_indices:
+                unmatched_english.append(
+                    {
+                        "index": i,
+                        "title": ch["title"],
+                        "best_match_score": original_sim[i].max().item(),
+                        "best_match_chinese": chi_chapters[
+                            original_sim[i].argmax().item()
+                        ]["title"],
+                    }
+                )
+
+        unmatched_chinese = []
+        for i, ch in enumerate(chi_chapters):
+            if i not in matched_chi_indices:
+                unmatched_chinese.append(
+                    {
+                        "index": i,
+                        "title": ch["title"],
+                        "best_match_score": original_sim[:, i].max().item(),
+                        "best_match_english": eng_chapters[
+                            original_sim[:, i].argmax().item()
+                        ]["title"],
+                    }
+                )
+
+        # Calculate matching statistics
+        alignment_stats = ChapterStats(
+            total_english_chapters=len(eng_chapters),
+            total_chinese_chapters=len(chi_chapters),
+            matched_pairs=len(pairs),
+            english_match_rate=len(pairs) / len(eng_chapters) if eng_chapters else 0,
+            chinese_match_rate=len(pairs) / len(chi_chapters) if chi_chapters else 0,
+            similarity_threshold=config.chapter_similarity_threshold,
+            matched_chapters=matched_details,
+            unmatched_english=unmatched_english,
+            unmatched_chinese=unmatched_chinese,
+        )
+
+        # Sort pairs by English chapter index for consistent ordering
+        pairs.sort()
+        return pairs, alignment_stats
+
+    except Exception as e:
+        logger.error(f"Error in automatic chapter alignment: {e}")
+        return [], ChapterStats()
+
+
+# Sentence alignment functions
+def align_sentences(
+    english_sentences: List[str],
+    chinese_sentences: List[str],
+    model_manager: ModelManager,
+    config: AlignmentConfig,
+) -> List[Dict]:
+    """Align sentences between two lists using semantic similarity."""
+    if not english_sentences or not chinese_sentences:
+        return []
+
+    embedding_model = model_manager.embedding_model
+    if not embedding_model:
+        logger.error("Embedding model not loaded. Cannot align sentences.")
+        return []
+
+    try:
+        with torch.no_grad():  # Save GPU memory
+            english_embeddings = embedding_model.encode(
+                english_sentences, convert_to_tensor=True
+            )
+            chinese_embeddings = embedding_model.encode(
+                chinese_sentences, convert_to_tensor=True
+            )
+    except Exception as e:
+        logger.error(f"Error encoding sentences: {e}")
+        return []
+
+    aligned_sentence_pairs = []
+    total_potential_alignments = 0
+    filtered_out_count = 0
+
+    # Vectorize similarity computation - calculate all similarities at once
+    similarities = util.cos_sim(english_embeddings, chinese_embeddings)
+    used_chinese_indices = set()
+
+    for i in range(len(english_sentences)):
+        if similarities is None or similarities.numel() == 0:
+            continue
+
+        # Find best match for this English sentence
+        row = similarities[i]
+        best_match_index = torch.argmax(row)
+        max_sim_score = row[best_match_index].item()
+        best_idx = best_match_index.item()
+
+        total_potential_alignments += 1
+
+        # Only align if score is above threshold and Chinese sentence hasn't been used
+        if (
+            max_sim_score >= config.similarity_threshold
+            and best_idx not in used_chinese_indices
+        ):
+            used_chinese_indices.add(best_idx)
+            aligned_sentence_pairs.append(
+                {
+                    "english": english_sentences[i],
+                    "chinese": chinese_sentences[best_idx],
+                    "score": max_sim_score,
+                }
+            )
+        else:
+            filtered_out_count += 1
+
+    if total_potential_alignments > 0:
+        logger.info(
+            f"    Filtered out {filtered_out_count}/{total_potential_alignments} "
+            f"alignments below threshold {config.similarity_threshold}"
+        )
+        if aligned_sentence_pairs:
+            scores = [pair["score"] for pair in aligned_sentence_pairs]
+            avg_score = sum(scores) / len(scores)
+            min_score = min(scores)
+            max_score = max(scores)
+            logger.info(
+                f"    Accepted alignments: avg={avg_score:.3f}, "
+                f"min={min_score:.3f}, max={max_score:.3f}"
+            )
+
+    return aligned_sentence_pairs
+
+
+class ChapterAlignmentManager:
+    """Manages chapter alignment strategies - complex logic justifies class."""
+
+    def __init__(self, model_manager: ModelManager, config: AlignmentConfig):
+        self.model_manager = model_manager
+        self.config = config
+
+    def get_chapter_alignments(
+        self,
+        english_chapters: List[Dict],
+        chinese_chapters: List[Dict],
+        manual_align: Optional[str] = None,
+        auto_align: bool = False,
+    ) -> Tuple[List[Tuple[Dict, Dict]], Optional[ChapterStats]]:
+        """Get chapter alignments using the specified strategy."""
+        logger.info("\n--- Chapter Alignment Input ---")
+
+        # Filter chapters to get only content chapters
+        english_content_chapters = [
+            ch for ch in english_chapters if is_content_chapter(ch["title"])
+        ]
+        chinese_content_chapters = [
+            ch for ch in chinese_chapters if is_content_chapter(ch["title"])
+        ]
+
+        self._log_chapter_info(english_content_chapters, chinese_content_chapters)
+
+        if manual_align and manual_align.strip():
+            return (
+                self._parse_manual_alignment(
+                    manual_align, english_content_chapters, chinese_content_chapters
+                ),
+                None,
+            )
+        elif auto_align:
+            return self._get_auto_alignment(
+                english_content_chapters, chinese_content_chapters
+            )
+        else:
+            return (
+                self._get_default_alignment(
+                    english_content_chapters, chinese_content_chapters
+                ),
+                None,
+            )
+
+    def _log_chapter_info(
+        self, english_chapters: List[Dict], chinese_chapters: List[Dict]
+    ) -> None:
+        """Log information about filtered chapters."""
+        logger.info("Filtered to content chapters:")
+        logger.info(f"English content chapters: {len(english_chapters)}")
+        for i, ch in enumerate(english_chapters[:5]):  # Show first 5
+            logger.info(f"  {i + 1}: {ch['title']}")
+        if len(english_chapters) > 5:
+            logger.info(f"  ... and {len(english_chapters) - 5} more")
+
+        logger.info(f"Chinese content chapters: {len(chinese_chapters)}")
+        for i, ch in enumerate(chinese_chapters[:5]):  # Show first 5
+            logger.info(f"  {i + 1}: {ch['title']}")
+        if len(chinese_chapters) > 5:
+            logger.info(f"  ... and {len(chinese_chapters) - 5} more")
+
+    def _parse_manual_alignment(
+        self,
+        manual_align: str,
+        english_chapters: List[Dict],
+        chinese_chapters: List[Dict],
+    ) -> List[Tuple[Dict, Dict]]:
+        """Parse manual alignment string."""
+        logger.info(f"Using manual alignment: {manual_align}")
+        aligned_pairs = []
+
         try:
             for pair in manual_align.split():
-                if '-' not in pair:
-                    print(f"Invalid pair format '{pair}'. Expected format: 'eng_idx-chi_idx'. Skipping.")
+                if "-" not in pair:
+                    logger.warning(
+                        f"Invalid pair format '{pair}'. Expected format: 'eng_idx-chi_idx'. Skipping."
+                    )
                     continue
-                    
-                eng_part, chi_part = pair.split('-', 1)
-                
+
+                eng_part, chi_part = pair.split("-", 1)
+
                 # Handle skip notation (0 means skip)
-                if eng_part == '0' or chi_part == '0':
-                    print(f"Skipping pair {pair} (contains 0)")
+                if eng_part == "0" or chi_part == "0":
+                    logger.info(f"Skipping pair {pair} (contains 0)")
                     continue
-                
-                # Parse English indices (support single or comma-separated)
+
+                # Parse and validate indices
                 try:
-                    eng_indices = [int(x.strip()) for x in eng_part.split(',')]
+                    eng_indices = [int(x.strip()) for x in eng_part.split(",")]
+                    chi_indices = [int(x.strip()) for x in chi_part.split(",")]
                 except ValueError:
-                    print(f"Invalid English indices in pair {pair}. Skipping.")
+                    logger.warning(f"Invalid indices in pair {pair}. Skipping.")
                     continue
-                
-                # Parse Chinese indices (support single or comma-separated)  
-                try:
-                    chi_indices = [int(x.strip()) for x in chi_part.split(',')]
-                except ValueError:
-                    print(f"Invalid Chinese indices in pair {pair}. Skipping.")
-                    continue
-                
-                # Validate indices and collect chapters
-                eng_chapters_for_pair = []
-                for idx in eng_indices:
-                    if 1 <= idx <= len(english_content_chapters):
-                        eng_chapters_for_pair.append(english_content_chapters[idx-1])
-                    else:
-                        print(f"English index {idx} out of range in pair {pair}. Skipping pair.")
-                        eng_chapters_for_pair = []
-                        break
-                
-                chi_chapters_for_pair = []
-                for idx in chi_indices:
-                    if 1 <= idx <= len(chinese_content_chapters):
-                        chi_chapters_for_pair.append(chinese_content_chapters[idx-1])
-                    else:
-                        print(f"Chinese index {idx} out of range in pair {pair}. Skipping pair.")
-                        chi_chapters_for_pair = []
-                        break
-                
-                # If we have valid chapters, create merged chapter objects
+
+                # Collect and merge chapters
+                eng_chapters_for_pair = self._get_chapters_by_indices(
+                    eng_indices, english_chapters, "English", pair
+                )
+                chi_chapters_for_pair = self._get_chapters_by_indices(
+                    chi_indices, chinese_chapters, "Chinese", pair
+                )
+
                 if eng_chapters_for_pair and chi_chapters_for_pair:
-                    # Merge English chapters
-                    eng_merged = {
-                        "title": " + ".join(ch["title"] for ch in eng_chapters_for_pair),
-                        "content": "\n\n".join(ch["content"] for ch in eng_chapters_for_pair)
-                    }
-                    
-                    # Merge Chinese chapters  
-                    chi_merged = {
-                        "title": " + ".join(ch["title"] for ch in chi_chapters_for_pair),
-                        "content": "\n\n".join(ch["content"] for ch in chi_chapters_for_pair)
-                    }
-                    
+                    eng_merged = self._merge_chapters(eng_chapters_for_pair)
+                    chi_merged = self._merge_chapters(chi_chapters_for_pair)
+
                     aligned_pairs.append((eng_merged, chi_merged))
-                    print(f"  Aligned: '{eng_merged['title']}' ↔ '{chi_merged['title']}'")
-                    
+                    logger.info(
+                        f"  Aligned: '{eng_merged['title']}' ↔ '{chi_merged['title']}'"
+                    )
+
         except Exception as e:
-            print(f"Error parsing manual alignment '{manual_align}': {e}. Falling back to defaults.")
-            aligned_pairs = []
+            logger.error(
+                f"Error parsing manual alignment '{manual_align}': {e}. Falling back to defaults."
+            )
+            return self._get_default_alignment(english_chapters, chinese_chapters)
 
-    # Handle automatic alignment
-    elif auto_align:
-        print("\nUsing automatic chapter alignment based on content similarity...")
-        idx_pairs, chapter_stats = auto_align_chapters(english_content_chapters, chinese_content_chapters)
-        aligned_pairs = [(english_content_chapters[i], chinese_content_chapters[j]) for i, j in idx_pairs]
-        
-        if aligned_pairs:
-            print(f"\nAutomatic alignment found {len(aligned_pairs)} chapter pairs:")
-            for eng_ch, chi_ch in aligned_pairs:
-                print(f"  '{eng_ch['title']}' ↔ '{chi_ch['title']}'")
-        else:
-            print("No suitable automatic alignments found.")
-        
-        # Store chapter alignment statistics for later use
-        global chapter_alignment_stats
-        chapter_alignment_stats = chapter_stats
+        return aligned_pairs
 
-    # Interactive mode (original behavior)
-    else:
-        print("Normally, you would enter chapter alignments here.")
-        print(
-            "For example, to align English chapter 1 with Chinese chapter 1, and English chapter 2 with Chinese chapter 3, you might enter: '1-1 2-3'"
+    def _get_chapters_by_indices(
+        self, indices: List[int], chapters: List[Dict], language: str, pair_name: str
+    ) -> List[Dict]:
+        """Get chapters by their indices."""
+        result_chapters = []
+        for idx in indices:
+            if 1 <= idx <= len(chapters):
+                result_chapters.append(chapters[idx - 1])
+            else:
+                logger.warning(
+                    f"{language} index {idx} out of range in pair {pair_name}. Skipping pair."
+                )
+                return []
+        return result_chapters
+
+    def _merge_chapters(self, chapters: List[Dict]) -> Dict:
+        """Merge multiple chapters into one."""
+        return {
+            "title": " + ".join(ch["title"] for ch in chapters),
+            "content": "\n\n".join(ch["content"] for ch in chapters),
+        }
+
+    def _get_auto_alignment(
+        self, english_chapters: List[Dict], chinese_chapters: List[Dict]
+    ) -> Tuple[List[Tuple[Dict, Dict]], ChapterStats]:
+        """Get automatic chapter alignment."""
+        logger.info("Using automatic chapter alignment based on content similarity...")
+        idx_pairs, chapter_stats = auto_align_chapters(
+            english_chapters, chinese_chapters, self.model_manager, self.config
         )
-        print("For m-to-n mapping, use commas: '3-4,5' means EN 3 ↔ CN 4+5")
-        print("Use '0' to skip: '3-0' means skip English chapter 3")
+        aligned_pairs = [
+            (english_chapters[i], chinese_chapters[j]) for i, j in idx_pairs
+        ]
 
-        # Get user input for chapter alignments
-        raw = input("\nEnter pairs (e.g. 1-1 2-3) or press ENTER to accept defaults: ")
-        if raw.strip():
-            # Reuse the manual alignment parsing logic
-            return get_user_chapter_alignments(english_chapters, chinese_chapters, manual_align=raw.strip())
+        if aligned_pairs:
+            logger.info(
+                f"Automatic alignment found {len(aligned_pairs)} chapter pairs:"
+            )
+            for eng_ch, chi_ch in aligned_pairs:
+                logger.info(f"  '{eng_ch['title']}' ↔ '{chi_ch['title']}'")
+        else:
+            logger.info("No suitable automatic alignments found.")
 
-    # If no alignments were made, use intelligent 1:1 alignment as fallback
-    if not aligned_pairs:
-        min_chapters = min(len(english_content_chapters), len(chinese_content_chapters))
+        return aligned_pairs, chapter_stats
+
+    def _get_default_alignment(
+        self, english_chapters: List[Dict], chinese_chapters: List[Dict]
+    ) -> List[Tuple[Dict, Dict]]:
+        """Get default 1:1 alignment."""
+        aligned_pairs = []
+        min_chapters = min(len(english_chapters), len(chinese_chapters))
 
         if min_chapters > 0:
-            print(
-                f"\nUsing intelligent 1:1 alignment for the first {min_chapters} content chapters:"
+            logger.info(
+                f"Using intelligent 1:1 alignment for the first {min_chapters} content chapters:"
             )
             for i in range(min_chapters):
-                eng_ch = english_content_chapters[i]
-                chi_ch = chinese_content_chapters[i]
+                eng_ch = english_chapters[i]
+                chi_ch = chinese_chapters[i]
                 aligned_pairs.append((eng_ch, chi_ch))
-                print(f"  English '{eng_ch['title']}' ↔ Chinese '{chi_ch['title']}'")
+                logger.info(
+                    f"  English '{eng_ch['title']}' ↔ Chinese '{chi_ch['title']}'"
+                )
         else:
-            print("No content chapters found for alignment.")
+            logger.info("No content chapters found for alignment.")
 
-    return aligned_pairs
+        return aligned_pairs
 
 
-def process_books(
-    english_book_path: str,
-    chinese_book_path: str,
-    output_file_path: str,
-    output_format: str = "tsv",
-    similarity_threshold: float = 0.7,
-    manual_align: str = None,
-    auto_align: bool = False,
-) -> bool:
-    """
-    Main processing function that aligns sentences from two books.
-    """
-    print(f"English book path: {english_book_path}")
-    print(f"Chinese book path: {chinese_book_path}")
-    print(f"Output file path: {output_file_path}")
-    print(f"Output format: {output_format}")
-    print(f"Similarity threshold: {similarity_threshold}")
+class BookAligner:
+    """Main class for aligning bilingual books - orchestration justifies class."""
 
-    load_embedding_model()
+    def __init__(self, config: AlignmentConfig = None):
+        self.config = config or AlignmentConfig()
+        self.model_manager = ModelManager(self.config)
+        self.alignment_manager = ChapterAlignmentManager(
+            self.model_manager, self.config
+        )
 
-    all_aligned_sentences = []
-    chapter_processing_details = []
+        # State for reporting
+        self.chapter_alignment_stats: Optional[ChapterStats] = None
 
-    try:
-        with open(english_book_path, "r", encoding="utf-8") as f:
-            english_book_content = f.read()
-        english_chapters = split_into_chapters(english_book_content)
-        print("English Chapters:")
-        for i, chapter in enumerate(english_chapters):
-            print(f"{i+1}: {chapter['title']}")
-    except FileNotFoundError:
-        print(f"Error: English book file not found at {english_book_path}")
-        return False
+    def process_books(
+        self,
+        english_book_path: Union[str, Path],
+        chinese_book_path: Union[str, Path],
+        output_file_path: Union[str, Path],
+        output_format: str = "tsv",
+        manual_align: Optional[str] = None,
+        auto_align: bool = False,
+    ) -> bool:
+        """Main processing function that aligns sentences from two books."""
+        english_path = Path(english_book_path)
+        chinese_path = Path(chinese_book_path)
+        output_path = Path(output_file_path)
 
-    try:
-        with open(chinese_book_path, "r", encoding="utf-8") as f:
-            chinese_book_content = f.read()
-        chinese_chapters = split_into_chapters(chinese_book_content)
-        print("Chinese Chapters:")
-        for i, chapter in enumerate(chinese_chapters):
-            print(f"{i+1}: {chapter['title']}")
-    except FileNotFoundError:
-        print(f"Error: Chinese book file not found at {chinese_book_path}")
-        return False
+        logger.info(f"English book path: {english_path}")
+        logger.info(f"Chinese book path: {chinese_path}")
+        logger.info(f"Output file path: {output_path}")
+        logger.info(f"Output format: {output_format}")
+        logger.info(f"Similarity threshold: {self.config.similarity_threshold}")
 
-    aligned_chapter_pairs = get_user_chapter_alignments(
-        english_chapters, chinese_chapters, manual_align=manual_align, auto_align=auto_align
-    )
+        try:
+            # Read and process books
+            english_content = read_file(english_path)
+            chinese_content = read_file(chinese_path)
 
-    if aligned_chapter_pairs:
-        for eng_chapter, chi_chapter in aligned_chapter_pairs:
-            print(
-                f"\nProcessing chapter: English '{eng_chapter['title']}' with Chinese '{chi_chapter['title']}'"
+            english_chapters = split_into_chapters(english_content)
+            chinese_chapters = split_into_chapters(chinese_content)
+
+            self._log_chapters(english_chapters, "English")
+            self._log_chapters(chinese_chapters, "Chinese")
+
+            # Get chapter alignments
+            aligned_chapter_pairs, chapter_stats = (
+                self.alignment_manager.get_chapter_alignments(
+                    english_chapters, chinese_chapters, manual_align, auto_align
+                )
             )
-            # Use different variable names to avoid shadowing
-            eng_chapter_content = eng_chapter["content"]
-            chi_chapter_content = chi_chapter["content"]
 
-            english_sentences = segment_sentences(eng_chapter_content, "english")
-            chinese_sentences = segment_sentences(chi_chapter_content, "chinese")
+            # Store chapter alignment stats for reporting
+            self.chapter_alignment_stats = chapter_stats
 
-            chapter_detail = {
-                "english_chapter": eng_chapter['title'],
-                "chinese_chapter": chi_chapter['title'],
-                "english_sentences_count": len(english_sentences),
-                "chinese_sentences_count": len(chinese_sentences),
-                "aligned_sentences_count": 0,
-                "sentence_match_rate": 0.0,
-                "avg_similarity_score": 0.0
-            }
+            if not aligned_chapter_pairs:
+                logger.error("No chapter alignments were made.")
+                return False
 
-            if EMBEDDING_MODEL and english_sentences and chinese_sentences:
-                current_chapter_alignments = align_sentences_in_chapters(
+            # Process aligned chapters
+            all_aligned_sentences, processing_details = self._process_aligned_chapters(
+                aligned_chapter_pairs
+            )
+
+            if all_aligned_sentences:
+                # Write output files
+                self._write_output_files(
+                    all_aligned_sentences,
+                    output_path,
+                    output_format,
+                    processing_details,
+                    english_path,
+                    chinese_path,
+                )
+                return True
+            else:
+                logger.error(
+                    "No sentences were aligned across any chapters. Output file not written."
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Error processing books: {e}")
+            return False
+
+    def _log_chapters(self, chapters: List[Dict], language: str) -> None:
+        """Log chapter information."""
+        logger.info(f"{language} Chapters:")
+        for i, chapter in enumerate(chapters):
+            logger.info(f"{i + 1}: {chapter['title']}")
+
+    def _process_aligned_chapters(
+        self, aligned_chapter_pairs: List[Tuple[Dict, Dict]]
+    ) -> Tuple[List[Dict], List[ProcessingDetails]]:
+        """Process aligned chapter pairs to extract sentence alignments."""
+        all_aligned_sentences = []
+        processing_details = []
+
+        for eng_chapter, chi_chapter in aligned_chapter_pairs:
+            logger.info(
+                f"\nProcessing chapter: English '{eng_chapter['title']}' "
+                f"with Chinese '{chi_chapter['title']}'"
+            )
+
+            # Segment sentences
+            english_sentences = segment_sentences(
+                eng_chapter["content"], "english", self.model_manager
+            )
+            chinese_sentences = segment_sentences(
+                chi_chapter["content"], "chinese", self.model_manager
+            )
+
+            # Create processing detail record
+            detail = ProcessingDetails(
+                english_chapter=eng_chapter["title"],
+                chinese_chapter=chi_chapter["title"],
+                english_sentences_count=len(english_sentences),
+                chinese_sentences_count=len(chinese_sentences),
+            )
+
+            # Align sentences if we have content
+            if english_sentences and chinese_sentences:
+                current_chapter_alignments = align_sentences(
                     english_sentences,
                     chinese_sentences,
-                    EMBEDDING_MODEL,
-                    similarity_threshold,
+                    self.model_manager,
+                    self.config,
                 )
+
                 if current_chapter_alignments:
                     all_aligned_sentences.extend(current_chapter_alignments)
-                    chapter_detail["aligned_sentences_count"] = len(current_chapter_alignments)
-                    chapter_detail["sentence_match_rate"] = len(current_chapter_alignments) / min(len(english_sentences), len(chinese_sentences))
-                    chapter_detail["avg_similarity_score"] = sum(pair["score"] for pair in current_chapter_alignments) / len(current_chapter_alignments)
-                    print(
-                        f"Found {len(current_chapter_alignments)} alignments in chapter '{eng_chapter['title']}' / '{chi_chapter['title']}'."
+                    detail.aligned_sentences_count = len(current_chapter_alignments)
+                    detail.sentence_match_rate = len(current_chapter_alignments) / min(
+                        len(english_sentences), len(chinese_sentences)
+                    )
+                    detail.avg_similarity_score = sum(
+                        pair["score"] for pair in current_chapter_alignments
+                    ) / len(current_chapter_alignments)
+                    logger.info(
+                        f"Found {len(current_chapter_alignments)} alignments in chapter "
+                        f"'{eng_chapter['title']}' / '{chi_chapter['title']}'."
                     )
                 else:
-                    print(
-                        f"No alignments found in chapter '{eng_chapter['title']}' / '{chi_chapter['title']}'."
+                    logger.info(
+                        f"No alignments found in chapter '{eng_chapter['title']}' / "
+                        f"'{chi_chapter['title']}'."
                     )
             else:
-                print(
-                    f"Skipping sentence alignment for chapter '{eng_chapter['title']}' / '{chi_chapter['title']}' due to missing content or model."
+                logger.info(
+                    f"Skipping sentence alignment for chapter '{eng_chapter['title']}' / "
+                    f"'{chi_chapter['title']}' due to missing content."
                 )
-            
-            chapter_processing_details.append(chapter_detail)
-    else:
-        print("No chapter alignments were made.")
-        return False
 
-    # Generate comprehensive alignment report
-    global chapter_alignment_stats
-    total_eng_sentences = sum(detail["english_sentences_count"] for detail in chapter_processing_details)
-    total_chi_sentences = sum(detail["chinese_sentences_count"] for detail in chapter_processing_details)
-    total_aligned_sentences = len(all_aligned_sentences)
-    
-    overall_stats = {
-        "processing_summary": {
-            "total_english_sentences": total_eng_sentences,
-            "total_chinese_sentences": total_chi_sentences,
-            "total_aligned_sentences": total_aligned_sentences,
-            "overall_sentence_match_rate": total_aligned_sentences / min(total_eng_sentences, total_chi_sentences) if total_eng_sentences and total_chi_sentences else 0,
-            "avg_alignment_score": sum(pair["score"] for pair in all_aligned_sentences) / len(all_aligned_sentences) if all_aligned_sentences else 0,
-            "similarity_threshold": similarity_threshold
-        },
-        "chapter_alignment_stats": chapter_alignment_stats,
-        "chapter_processing_details": chapter_processing_details,
-        "metadata": {
-            "english_book_path": english_book_path,
-            "chinese_book_path": chinese_book_path,
-            "output_file_path": output_file_path,
-            "output_format": output_format
-        }
-    }
+            processing_details.append(detail)
 
-    # Print summary statistics
-    print(f"\n=== ALIGNMENT SUMMARY ===")
-    print(f"Chapter-level matching:")
-    if chapter_alignment_stats:
-        print(f"  English chapters: {chapter_alignment_stats.get('total_english_chapters', 0)}")
-        print(f"  Chinese chapters: {chapter_alignment_stats.get('total_chinese_chapters', 0)}")
-        print(f"  Matched chapter pairs: {chapter_alignment_stats.get('matched_pairs', 0)}")
-        print(f"  English chapter match rate: {chapter_alignment_stats.get('english_match_rate', 0):.1%}")
-        print(f"  Chinese chapter match rate: {chapter_alignment_stats.get('chinese_match_rate', 0):.1%}")
-        
-        if chapter_alignment_stats.get('unmatched_english'):
-            print(f"\n  Unmatched English chapters:")
-            for ch in chapter_alignment_stats['unmatched_english']:
-                print(f"    - {ch['title']} (best match: {ch['best_match_chinese']}, score: {ch['best_match_score']:.3f})")
-        
-        if chapter_alignment_stats.get('unmatched_chinese'):
-            print(f"\n  Unmatched Chinese chapters:")
-            for ch in chapter_alignment_stats['unmatched_chinese']:
-                print(f"    - {ch['title']} (best match: {ch['best_match_english']}, score: {ch['best_match_score']:.3f})")
-    
-    print(f"\nSentence-level matching:")
-    print(f"  Total English sentences: {total_eng_sentences}")
-    print(f"  Total Chinese sentences: {total_chi_sentences}")
-    print(f"  Total aligned sentence pairs: {total_aligned_sentences}")
-    print(f"  Overall sentence match rate: {overall_stats['processing_summary']['overall_sentence_match_rate']:.1%}")
-    print(f"  Average alignment score: {overall_stats['processing_summary']['avg_alignment_score']:.3f}")
+        return all_aligned_sentences, processing_details
 
-    if all_aligned_sentences:
+    def _write_output_files(
+        self,
+        aligned_sentences: List[Dict],
+        output_path: Path,
+        output_format: str,
+        processing_details: List[ProcessingDetails],
+        english_path: Path,
+        chinese_path: Path,
+    ) -> None:
+        """Write output files and generate reports."""
+        # Write main output file
         if output_format == "tsv":
-            write_to_tsv(all_aligned_sentences, output_file_path)
+            write_tsv(aligned_sentences, output_path)
         elif output_format == "json":
-            write_to_json(all_aligned_sentences, output_file_path)
-        
-        # Write detailed alignment report
-        write_match_report(overall_stats, output_file_path)
-        return True
-    else:
-        print("No sentences were aligned across any chapters. Output file not written.")
-        return False
+            write_json(aligned_sentences, output_path)
+
+        # Generate and write comprehensive report
+        report_data = self._generate_report(
+            aligned_sentences,
+            processing_details,
+            english_path,
+            chinese_path,
+            output_path,
+            output_format,
+        )
+        write_alignment_report(report_data, output_path)
+
+        # Print summary
+        self._print_summary(report_data)
+
+    def _generate_report(
+        self,
+        aligned_sentences: List[Dict],
+        processing_details: List[ProcessingDetails],
+        english_path: Path,
+        chinese_path: Path,
+        output_path: Path,
+        output_format: str,
+    ) -> Dict:
+        """Generate comprehensive alignment report."""
+        total_eng_sentences = sum(
+            detail.english_sentences_count for detail in processing_details
+        )
+        total_chi_sentences = sum(
+            detail.chinese_sentences_count for detail in processing_details
+        )
+        total_aligned_sentences = len(aligned_sentences)
+
+        return {
+            "processing_summary": {
+                "total_english_sentences": total_eng_sentences,
+                "total_chinese_sentences": total_chi_sentences,
+                "total_aligned_sentences": total_aligned_sentences,
+                "overall_sentence_match_rate": (
+                    total_aligned_sentences
+                    / min(total_eng_sentences, total_chi_sentences)
+                    if total_eng_sentences and total_chi_sentences
+                    else 0
+                ),
+                "avg_alignment_score": (
+                    sum(pair["score"] for pair in aligned_sentences)
+                    / len(aligned_sentences)
+                    if aligned_sentences
+                    else 0
+                ),
+                "similarity_threshold": self.config.similarity_threshold,
+            },
+            "chapter_alignment_stats": (
+                self.chapter_alignment_stats.__dict__
+                if self.chapter_alignment_stats
+                else {}
+            ),
+            "chapter_processing_details": [
+                detail.__dict__ for detail in processing_details
+            ],
+            "metadata": {
+                "english_book_path": str(english_path),
+                "chinese_book_path": str(chinese_path),
+                "output_file_path": str(output_path),
+                "output_format": output_format,
+            },
+        }
+
+    def _print_summary(self, report_data: Dict) -> None:
+        """Print alignment summary statistics."""
+        processing_summary = report_data["processing_summary"]
+        chapter_alignment_stats = report_data.get("chapter_alignment_stats", {})
+
+        logger.info("=== ALIGNMENT SUMMARY ===")
+        logger.info("Chapter-level matching:")
+
+        if chapter_alignment_stats:
+            logger.info(
+                f"  English chapters: {chapter_alignment_stats.get('total_english_chapters', 0)}"
+            )
+            logger.info(
+                f"  Chinese chapters: {chapter_alignment_stats.get('total_chinese_chapters', 0)}"
+            )
+            logger.info(
+                f"  Matched chapter pairs: {chapter_alignment_stats.get('matched_pairs', 0)}"
+            )
+            logger.info(
+                f"  English chapter match rate: {chapter_alignment_stats.get('english_match_rate', 0):.1%}"
+            )
+            logger.info(
+                f"  Chinese chapter match rate: {chapter_alignment_stats.get('chinese_match_rate', 0):.1%}"
+            )
+
+            if chapter_alignment_stats.get("unmatched_english"):
+                logger.info("  Unmatched English chapters:")
+                for ch in chapter_alignment_stats["unmatched_english"]:
+                    logger.info(
+                        f"    - {ch['title']} (best match: {ch['best_match_chinese']}, score: {ch['best_match_score']:.3f})"
+                    )
+
+            if chapter_alignment_stats.get("unmatched_chinese"):
+                logger.info("  Unmatched Chinese chapters:")
+                for ch in chapter_alignment_stats["unmatched_chinese"]:
+                    logger.info(
+                        f"    - {ch['title']} (best match: {ch['best_match_english']}, score: {ch['best_match_score']:.3f})"
+                    )
+
+        logger.info("Sentence-level matching:")
+        logger.info(
+            f"  Total English sentences: {processing_summary['total_english_sentences']}"
+        )
+        logger.info(
+            f"  Total Chinese sentences: {processing_summary['total_chinese_sentences']}"
+        )
+        logger.info(
+            f"  Total aligned sentence pairs: {processing_summary['total_aligned_sentences']}"
+        )
+        logger.info(
+            f"  Overall sentence match rate: {processing_summary['overall_sentence_match_rate']:.1%}"
+        )
+        logger.info(
+            f"  Average alignment score: {processing_summary['avg_alignment_score']:.3f}"
+        )
 
 
 def main():
@@ -771,8 +1056,8 @@ def main():
     parser.add_argument(
         "--align",
         help='Manual chapter mapping, e.g. "1-1 2-3 4-0". '
-             '"0" on either side means "skip this chapter". '
-             'Supports m-to-n mapping like "3-4,5" (EN 3 ↔ CN 4+5).',
+        '"0" on either side means "skip this chapter". '
+        'Supports m-to-n mapping like "3-4,5" (EN 3 ↔ CN 4+5).',
     )
     parser.add_argument(
         "--auto-align",
@@ -782,12 +1067,14 @@ def main():
 
     args = parser.parse_args()
 
-    success = process_books(
+    config = AlignmentConfig(similarity_threshold=args.similarity_threshold)
+    aligner = BookAligner(config)
+
+    success = aligner.process_books(
         english_book_path=args.english_book_path,
         chinese_book_path=args.chinese_book_path,
         output_file_path=args.output_file_path,
         output_format=args.format,
-        similarity_threshold=args.similarity_threshold,
         manual_align=args.align,
         auto_align=args.auto_align,
     )
@@ -797,4 +1084,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -12,21 +12,13 @@ Aligns English and Chinese sentences from books in Markdown format using sentenc
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-2. Install the project and its dependencies:
+2. Install the project and its dependencies (including spaCy models):
 
 ```bash
 uv sync
 ```
 
-3. Download spaCy models:
-
-```bash
-# uv pip install pip
-uv run python -m spacy download en_core_web_sm
-uv run python -m spacy download zh_core_web_sm
-```
-
-4. Run
+3. Run
 
 ```bash
 # uv run bilingual-align <english_book.md> <chinese_book.md> <output_file> [--format tsv|json]
