@@ -45,9 +45,9 @@ ENV/
 ehthumbs.db
 Thumbs.db
 
-# Documentation
-README.md
+# Documentation (exclude all .md files except README.md)
 *.md
+!README.md
 
 # Output files
 *.tsv
