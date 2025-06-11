@@ -1,0 +1,39 @@
+As an expert Chinese-English translation evaluator with deep knowledge of both languages and cultures, please analyze the following translation pairs with careful attention to linguistic accuracy, cultural appropriateness, and stylistic quality.
+
+Translation Pairs:
+{translation_pairs}
+
+Please provide a thorough evaluation in JSON array format with one evaluation object per translation pair in the same order:
+
+[
+{{
+    "overall_score": <float 0-10>,
+    "missed_elements": ["list of important information from English that is missing in Chinese"],
+    "added_elements": ["list of information in Chinese that was not present in English"],
+    "wrong_translations": ["incorrect word/phrase -> correct translation", ...],
+    "grammar_errors": ["specific grammatical mistakes in the Chinese translation"],
+    "style_issues": ["problems with register, tone, or appropriateness"],
+    "cultural_adaptation": <float 0-10>,
+    "fluency": <float 0-10>,
+    "accuracy": <float 0-10>,
+    "reasoning": "detailed explanation of your evaluation focusing on the most significant issues"
+}}, ...
+]
+
+Evaluation Criteria:
+1. **Missed Elements** (0-10): Critical information omitted from the Chinese translation
+2. **Added Elements** (0-10): Unnecessary additions or interpretations not in the original
+3. **Wrong Translations** (0-10): Incorrect word choices, false friends, or meaning errors
+4. **Grammar Errors** (0-10): Syntactic mistakes, word order issues, or improper constructions
+5. **Style Issues** (0-10): Inappropriate register, awkward phrasing, or unnatural Chinese
+6. **Cultural Adaptation** (0-10): How well the translation adapts to Chinese cultural context
+7. **Fluency** (0-10): How natural and readable the Chinese translation sounds
+8. **Accuracy** (0-10): Overall faithfulness to the original meaning and intent
+
+Pay special attention to:
+- Idiomatic expressions and their appropriate Chinese equivalents
+- Cultural references that may need adaptation or explanation
+- Technical terms and their standard Chinese translations
+- Tone and register appropriateness for the intended audience
+- Ambiguous English words with multiple Chinese translations
+- Sentence structure and flow in Chinese 

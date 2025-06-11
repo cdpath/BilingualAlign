@@ -24,6 +24,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 # Copy project files
 COPY pyproject.toml uv.lock* LICENSE README.md ./
 COPY src/ ./src/
+COPY prompts/ ./prompts/
+COPY examples/ ./examples/
 
 # Install the project and dependencies
 RUN uv sync --frozen --no-dev
@@ -38,5 +40,6 @@ RUN uv run python -m spacy download zh_core_web_sm
 # Download sentence-transformers model
 RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
 
-# Set the entrypoint
-ENTRYPOINT ["uv", "run", "bilingual-align"]
+# Set the entrypoint (can be overridden)
+ENTRYPOINT ["uv", "run"]
+CMD ["bilingual-align"]

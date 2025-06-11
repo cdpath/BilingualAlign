@@ -176,3 +176,4 @@ cython_debug/
 output/
 sample_books/
 .DS_Store
+*.tsv

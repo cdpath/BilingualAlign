@@ -1,0 +1,23 @@
+Evaluate the following English to Chinese translation pairs quickly and accurately:
+
+Translation Pairs:
+{translation_pairs}
+
+Provide evaluation in JSON array format with one evaluation object per translation pair in the same order:
+
+[
+{{
+    "overall_score": <float 0-10>,
+    "missed_elements": ["key missing content"],
+    "added_elements": ["unnecessary additions"],
+    "wrong_translations": ["errors"],
+    "grammar_errors": ["grammar issues"],
+    "style_issues": ["style problems"],
+    "cultural_adaptation": <float 0-10>,
+    "fluency": <float 0-10>,
+    "accuracy": <float 0-10>,
+    "reasoning": "brief summary of main issues"
+}}, ...
+]
+
+Focus on the most critical translation errors and overall quality. 
